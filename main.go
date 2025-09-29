@@ -17,23 +17,26 @@ import (
 	"github.com/gorilla/mux"
 )
 
+// ================= STRUCTS ===================
+
 type ConvertRequest struct {
 	URL     string `json:"url"`
-	Format  string `json:"format"`  // mp3 or mp4
+	Format  string `json:"format"`  // mp3, mp4, image
 	Quality string `json:"quality"` // mp4: 1080,720,320 | mp3: 128,192,320
 }
 
 type ConvertResponse struct {
 	Message  string `json:"message"`
 	FilePath string `json:"file_path"`
+	Error    string `json:"error,omitempty"`
 }
 
-// ================= API PART ===================
+// ================= API HANDLERS ===================
 
 func convertHandler(w http.ResponseWriter, r *http.Request) {
 	var req ConvertRequest
 	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil || (req.Format != "mp3" && req.Format != "mp4") {
+	if err != nil {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
@@ -41,35 +44,103 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 	// Ensure downloads folder exists
 	os.MkdirAll("downloads", os.ModePerm)
 
-	fileName := fmt.Sprintf("downloads/video_%d.%s", time.Now().Unix(), req.Format)
+	var fileName string
 	var cmd *exec.Cmd
 
-	if req.Format == "mp4" {
-		var quality string
-		switch req.Quality {
-		case "1080":
-			quality = "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/mp4"
-		case "720":
-			quality = "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/mp4"
-		case "320":
-			quality = "bestvideo[height<=320][ext=mp4]+bestaudio[ext=m4a]/mp4"
-		default:
-			quality = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4"
+	switch req.Format {
+	case "mp4":
+		fileName = fmt.Sprintf("downloads/video_%d.mp4", time.Now().Unix())
+		quality := "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+		if req.Quality != "" {
+			quality = fmt.Sprintf(
+				"bestvideo[height<=%s][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=%s]+bestaudio/best[height<=%s]",
+				req.Quality, req.Quality, req.Quality,
+			)
 		}
-		// Force FFmpeg to mux video+audio
-		cmd = exec.Command("yt-dlp", "-f", quality, "--merge-output-format", "mp4", "-o", fileName, req.URL)
 
-	} else if req.Format == "mp3" {
+		cmd = exec.Command("yt-dlp",
+			"-f", quality,
+			"--merge-output-format", "mp4",
+			"--no-playlist",
+			"--no-abort-on-error",
+			"--continue",
+			"--no-overwrites",
+			"--restrict-filenames",
+			"-o", fileName,
+			req.URL)
+
+	case "mp3":
+		fileName = fmt.Sprintf("downloads/audio_%d.%%(ext)s", time.Now().Unix())
 		bitrate := "128"
 		if req.Quality != "" {
 			bitrate = req.Quality
 		}
-		cmd = exec.Command("yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", bitrate, "-o", fileName, req.URL)
+
+		cmd = exec.Command("yt-dlp",
+			"-x",
+			"--audio-format", "mp3",
+			"--audio-quality", bitrate,
+			"--no-playlist",
+			"--no-abort-on-error",
+			"--continue",
+			"--no-overwrites",
+			"--restrict-filenames",
+			"-o", fileName,
+			req.URL)
+
+	case "image":
+		fileName = fmt.Sprintf("downloads/image_%d.%%(ext)s", time.Now().Unix())
+		cmd = exec.Command("yt-dlp",
+			"--skip-download",
+			"--write-thumbnail",
+			"--no-playlist",
+			"--convert-thumbnails", "jpg",
+			"--restrict-filenames",
+			"-o", fileName,
+			req.URL)
+
+	default:
+		res := ConvertResponse{Error: "Invalid format"}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(res)
+		return
 	}
 
+	log.Printf("Executing command: %v", cmd.Args)
 	out, err := cmd.CombinedOutput()
+
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Error: %s\n%s", err.Error(), string(out)), http.StatusInternalServerError)
+		log.Printf("Command error: %s\nOutput: %s", err.Error(), string(out))
+		res := ConvertResponse{
+			Error: fmt.Sprintf("Conversion failed: %s", err.Error()),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(res)
+		return
+	}
+
+	// Handle dynamic file extension for audio and images
+	if strings.Contains(fileName, "%(ext)s") {
+		matches, _ := filepath.Glob(strings.Replace(fileName, "%(ext)s", "*", 1))
+		if len(matches) > 0 {
+			fileName = matches[0]
+		} else {
+			res := ConvertResponse{Error: "Converted file not found"}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(res)
+			return
+		}
+	}
+
+	// Verify file exists and has content
+	if stat, err := os.Stat(fileName); err != nil || stat.Size() == 0 {
+		res := ConvertResponse{Error: "Converted file is empty or not found"}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(res)
 		return
 	}
 
@@ -77,6 +148,7 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 		Message:  "Conversion successful",
 		FilePath: fmt.Sprintf("/downloads/%s", filepath.Base(fileName)),
 	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(res)
 }
 
@@ -85,20 +157,28 @@ func downloadsHandler(w http.ResponseWriter, r *http.Request) {
 	filename := vars["filename"]
 	filePath := "downloads/" + filename
 
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
 	http.ServeFile(w, r, filePath)
 
-	// delete after serving
 	go func() {
-		time.Sleep(2 * time.Second)
-		os.Remove(filePath)
+		time.Sleep(10 * time.Second)
+		if err := os.Remove(filePath); err != nil {
+			log.Printf("Error deleting file %s: %v", filePath, err)
+		} else {
+			log.Printf("Successfully deleted file: %s", filePath)
+		}
 	}()
 }
 
 // ================= TELEGRAM BOT PART ===================
 
-var userStates = make(map[int64]string) // userID -> state
-var userURLs = make(map[int64]string)   // userID -> URL
-var userFormat = make(map[int64]string) // userID -> mp3/mp4
+var userStates = make(map[int64]string)
+var userURLs = make(map[int64]string)
+var userFormat = make(map[int64]string)
 
 func handleTelegramBot(bot *tgbotapi.BotAPI) {
 	u := tgbotapi.NewUpdate(0)
@@ -106,12 +186,16 @@ func handleTelegramBot(bot *tgbotapi.BotAPI) {
 	updates := bot.GetUpdatesChan(u)
 
 	for update := range updates {
+		if update.FromChat() == nil {
+			continue
+		}
+
 		chatID := update.FromChat().ID
 
 		if update.Message != nil {
 			if update.Message.Text == "/start" {
 				userStates[chatID] = "waiting_url"
-				msg := tgbotapi.NewMessage(chatID, "Welcome! Send me a YouTube URL to download:")
+				msg := tgbotapi.NewMessage(chatID, "Welcome! Send me a YouTube/Instagram/TikTok URL to download:")
 				bot.Send(msg)
 				continue
 			}
@@ -124,6 +208,7 @@ func handleTelegramBot(bot *tgbotapi.BotAPI) {
 					tgbotapi.NewInlineKeyboardRow(
 						tgbotapi.NewInlineKeyboardButtonData("🎥 MP4 (Video)", "format_mp4"),
 						tgbotapi.NewInlineKeyboardButtonData("🎵 MP3 (Audio)", "format_mp3"),
+						tgbotapi.NewInlineKeyboardButtonData("📷 Image", "format_image"),
 					),
 				)
 				msg := tgbotapi.NewMessage(chatID, "Choose format:")
@@ -164,77 +249,115 @@ func handleTelegramBot(bot *tgbotapi.BotAPI) {
 				msg.ReplyMarkup = keyboard
 				bot.Send(msg)
 
-			case "mp4_1080", "mp4_720", "mp4_320", "mp3_128", "mp3_192", "mp3_320":
-				var quality string
-				if strings.HasPrefix(data, "mp4") {
-					quality = strings.TrimPrefix(data, "mp4_")
-				} else {
-					quality = strings.TrimPrefix(data, "mp3_")
-				}
+			case "format_image":
+				userFormat[chatID] = "image"
+				processConversion(bot, chatID, "image", "")
 
-				// tell user to wait
-				waitMsg := tgbotapi.NewMessage(chatID, "⏳ Please wait, downloading and converting your file...")
-				sentMsg, _ := bot.Send(waitMsg)
+			case "mp4_1080", "mp4_720", "mp4_320":
+				quality := strings.TrimPrefix(data, "mp4_")
+				processConversion(bot, chatID, "mp4", quality)
 
-				req := ConvertRequest{
-					URL:     userURLs[chatID],
-					Format:  userFormat[chatID],
-					Quality: quality,
-				}
-				reqBody, _ := json.Marshal(req)
-
-				resp, err := http.Post("http://localhost:8080/api/convert", "application/json", bytes.NewBuffer(reqBody))
-				if err != nil {
-					bot.Send(tgbotapi.NewMessage(chatID, "API error: "+err.Error()))
-					continue
-				}
-				defer resp.Body.Close()
-
-				var apiResp ConvertResponse
-				json.NewDecoder(resp.Body).Decode(&apiResp)
-
-				// Download file from API
-				downloadURL := "http://localhost:8080" + apiResp.FilePath
-				fileResp, err := http.Get(downloadURL)
-				if err != nil {
-					bot.Send(tgbotapi.NewMessage(chatID, "Download error"))
-					continue
-				}
-				defer fileResp.Body.Close()
-
-				tempFile, err := os.CreateTemp("", "tgfile_*."+req.Format)
-				if err != nil {
-					bot.Send(tgbotapi.NewMessage(chatID, "File error"))
-					continue
-				}
-				io.Copy(tempFile, fileResp.Body)
-				tempFile.Seek(0, 0)
-
-				// send file
-				if req.Format == "mp3" {
-					audio := tgbotapi.NewAudio(chatID, tgbotapi.FilePath(tempFile.Name()))
-					bot.Send(audio)
-				} else {
-					video := tgbotapi.NewVideo(chatID, tgbotapi.FilePath(tempFile.Name()))
-					bot.Send(video)
-				}
-
-				// delete local temp
-				tempFile.Close()
-				os.Remove(tempFile.Name())
-
-				// edit wait message to success
-				edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "✅ Done! Your file has been sent.")
-				bot.Send(edit)
+			case "mp3_128", "mp3_192", "mp3_320":
+				quality := strings.TrimPrefix(data, "mp3_")
+				processConversion(bot, chatID, "mp3", quality)
 			}
 		}
 	}
 }
 
+func processConversion(bot *tgbotapi.BotAPI, chatID int64, format, quality string) {
+	waitMsg := tgbotapi.NewMessage(chatID, "⏳ Please wait, downloading and converting your file... This may take several minutes for long videos.")
+	sentMsg, _ := bot.Send(waitMsg)
+
+	req := ConvertRequest{
+		URL:     userURLs[chatID],
+		Format:  format,
+		Quality: quality,
+	}
+	reqBody, _ := json.Marshal(req)
+
+	client := &http.Client{
+		Timeout: 30 * time.Minute,
+	}
+
+	resp, err := client.Post("http://localhost:8080/api/convert", "application/json", bytes.NewBuffer(reqBody))
+	if err != nil {
+		edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "❌ API error: "+err.Error())
+		bot.Send(edit)
+		return
+	}
+	defer resp.Body.Close()
+
+	var apiResp ConvertResponse
+	json.NewDecoder(resp.Body).Decode(&apiResp)
+
+	if apiResp.Error != "" {
+		edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "❌ Conversion error: "+apiResp.Error)
+		bot.Send(edit)
+		return
+	}
+
+	edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "📤 File converted successfully! Now uploading to Telegram...")
+	bot.Send(edit)
+
+	downloadURL := "http://localhost:8080" + apiResp.FilePath
+	fileResp, err := client.Get(downloadURL)
+	if err != nil {
+		edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "❌ Download error: "+err.Error())
+		bot.Send(edit)
+		return
+	}
+	defer fileResp.Body.Close()
+
+	tempFile, err := os.CreateTemp("", "tgfile_*."+format)
+	if err != nil {
+		edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "❌ File error: "+err.Error())
+		bot.Send(edit)
+		return
+	}
+
+	_, err = io.Copy(tempFile, fileResp.Body)
+	if err != nil {
+		tempFile.Close()
+		os.Remove(tempFile.Name())
+		edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "❌ File copy error: "+err.Error())
+		bot.Send(edit)
+		return
+	}
+	tempFile.Close()
+
+	var sendErr error
+	switch format {
+	case "image":
+		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FilePath(tempFile.Name()))
+		_, sendErr = bot.Send(photo)
+	case "mp3":
+		audio := tgbotapi.NewAudio(chatID, tgbotapi.FilePath(tempFile.Name()))
+		_, sendErr = bot.Send(audio)
+	case "mp4":
+		video := tgbotapi.NewVideo(chatID, tgbotapi.FilePath(tempFile.Name()))
+		_, sendErr = bot.Send(video)
+	}
+
+	os.Remove(tempFile.Name())
+
+	if sendErr != nil {
+		edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "❌ Failed to send file: "+sendErr.Error())
+		bot.Send(edit)
+		return
+	}
+
+	edit = tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "✅ Done! Your file has been sent and temporary files have been cleaned up.")
+	bot.Send(edit)
+
+	delete(userStates, chatID)
+	delete(userURLs, chatID)
+	delete(userFormat, chatID)
+}
+
 // ================= MAIN ===================
 
 func main() {
-	// Start API server
 	go func() {
 		r := mux.NewRouter()
 		r.HandleFunc("/api/convert", convertHandler).Methods("POST")
@@ -244,7 +367,6 @@ func main() {
 		log.Fatal(http.ListenAndServe(":8080", r))
 	}()
 
-	// Start Telegram bot
 	bot, err := tgbotapi.NewBotAPI("7144449198:AAHoMTB8azWfEo1WvbQ4A_EBF-2lO-TsNxQ")
 	if err != nil {
 		log.Fatal("Telegram bot error:", err)
