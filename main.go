@@ -18,7 +18,6 @@ import (
 )
 
 // ================= STRUCTS ===================
-
 type ConvertRequest struct {
 	URL     string `json:"url"`
 	Format  string `json:"format"`  // mp3, mp4, image
@@ -28,11 +27,11 @@ type ConvertRequest struct {
 type ConvertResponse struct {
 	Message  string `json:"message"`
 	FilePath string `json:"file_path"`
+	FileSize string `json:"file_size"` // New field for file size
 	Error    string `json:"error,omitempty"`
 }
 
 // ================= API HANDLERS ===================
-
 func convertHandler(w http.ResponseWriter, r *http.Request) {
 	var req ConvertRequest
 	err := json.NewDecoder(r.Body).Decode(&req)
@@ -43,7 +42,6 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Ensure downloads folder exists
 	os.MkdirAll("downloads", os.ModePerm)
-
 	var fileName string
 	var cmd *exec.Cmd
 
@@ -57,7 +55,6 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 				req.Quality, req.Quality, req.Quality,
 			)
 		}
-
 		cmd = exec.Command("yt-dlp",
 			"-f", quality,
 			"--merge-output-format", "mp4",
@@ -68,14 +65,12 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 			"--restrict-filenames",
 			"-o", fileName,
 			req.URL)
-
 	case "mp3":
 		fileName = fmt.Sprintf("downloads/audio_%d.%%(ext)s", time.Now().Unix())
 		bitrate := "128"
 		if req.Quality != "" {
 			bitrate = req.Quality
 		}
-
 		cmd = exec.Command("yt-dlp",
 			"-x",
 			"--audio-format", "mp3",
@@ -87,7 +82,6 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 			"--restrict-filenames",
 			"-o", fileName,
 			req.URL)
-
 	case "image":
 		fileName = fmt.Sprintf("downloads/image_%d.%%(ext)s", time.Now().Unix())
 		cmd = exec.Command("yt-dlp",
@@ -98,7 +92,6 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 			"--restrict-filenames",
 			"-o", fileName,
 			req.URL)
-
 	default:
 		res := ConvertResponse{Error: "Invalid format"}
 		w.Header().Set("Content-Type", "application/json")
@@ -109,7 +102,6 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Executing command: %v", cmd.Args)
 	out, err := cmd.CombinedOutput()
-
 	if err != nil {
 		log.Printf("Command error: %s\nOutput: %s", err.Error(), string(out))
 		res := ConvertResponse{
@@ -136,7 +128,8 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify file exists and has content
-	if stat, err := os.Stat(fileName); err != nil || stat.Size() == 0 {
+	fileInfo, err := os.Stat(fileName)
+	if err != nil || fileInfo.Size() == 0 {
 		res := ConvertResponse{Error: "Converted file is empty or not found"}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -144,26 +137,86 @@ func convertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Calculate file size in MB
+	fileSizeMB := float64(fileInfo.Size()) / (1024 * 1024)
+	fileSizeStr := fmt.Sprintf("%.1f MB", fileSizeMB)
+
 	res := ConvertResponse{
 		Message:  "Conversion successful",
 		FilePath: fmt.Sprintf("/downloads/%s", filepath.Base(fileName)),
+		FileSize: fileSizeStr, // Include file size in response
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(res)
+}
+func infoHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	cmd := exec.Command("yt-dlp", "--dump-json", req.URL)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("Command error: %s\nOutput: %s", err.Error(), string(out))
+		res := struct {
+			Error string `json:"error"`
+		}{Error: fmt.Sprintf("Failed to fetch video info: %s", err.Error())}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(res)
+		return
+	}
+
+	var info map[string]interface{}
+	if err := json.Unmarshal(out, &info); err != nil {
+		res := struct {
+			Error string `json:"error"`
+		}{Error: fmt.Sprintf("Failed to parse video info: %s", err.Error())}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(res)
+		return
+	}
+
+	// Extract relevant info
+	response := map[string]interface{}{
+		"title":     info["title"],
+		"duration":  info["duration"],
+		"views":     info["view_count"],
+		"channel":   info["channel"],
+		"thumbnail": info["thumbnail"],
+		"platform":  getPlatformFromURL(req.URL),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func getPlatformFromURL(url string) string {
+	if strings.Contains(url, "youtube.com") || strings.Contains(url, "youtu.be") {
+		return "YouTube"
+	} else if strings.Contains(url, "instagram.com") {
+		return "Instagram"
+	} else if strings.Contains(url, "tiktok.com") {
+		return "TikTok"
+	}
+	return "Unknown"
 }
 
 func downloadsHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	filename := vars["filename"]
 	filePath := "downloads/" + filename
-
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
-
 	http.ServeFile(w, r, filePath)
-
 	go func() {
 		time.Sleep(10 * time.Second)
 		if err := os.Remove(filePath); err != nil {
@@ -175,7 +228,6 @@ func downloadsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // ================= TELEGRAM BOT PART ===================
-
 var userStates = make(map[int64]string)
 var userURLs = make(map[int64]string)
 var userFormat = make(map[int64]string)
@@ -184,14 +236,11 @@ func handleTelegramBot(bot *tgbotapi.BotAPI) {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	updates := bot.GetUpdatesChan(u)
-
 	for update := range updates {
 		if update.FromChat() == nil {
 			continue
 		}
-
 		chatID := update.FromChat().ID
-
 		if update.Message != nil {
 			if update.Message.Text == "/start" {
 				userStates[chatID] = "waiting_url"
@@ -199,11 +248,9 @@ func handleTelegramBot(bot *tgbotapi.BotAPI) {
 				bot.Send(msg)
 				continue
 			}
-
 			if userStates[chatID] == "waiting_url" {
 				userURLs[chatID] = update.Message.Text
 				userStates[chatID] = "waiting_format"
-
 				keyboard := tgbotapi.NewInlineKeyboardMarkup(
 					tgbotapi.NewInlineKeyboardRow(
 						tgbotapi.NewInlineKeyboardButtonData("🎥 MP4 (Video)", "format_mp4"),
@@ -216,10 +263,8 @@ func handleTelegramBot(bot *tgbotapi.BotAPI) {
 				bot.Send(msg)
 			}
 		}
-
 		if update.CallbackQuery != nil {
 			data := update.CallbackQuery.Data
-
 			switch data {
 			case "format_mp4":
 				userFormat[chatID] = "mp4"
@@ -234,7 +279,6 @@ func handleTelegramBot(bot *tgbotapi.BotAPI) {
 				msg := tgbotapi.NewMessage(chatID, "Choose MP4 quality:")
 				msg.ReplyMarkup = keyboard
 				bot.Send(msg)
-
 			case "format_mp3":
 				userFormat[chatID] = "mp3"
 				userStates[chatID] = "waiting_quality_mp3"
@@ -248,15 +292,12 @@ func handleTelegramBot(bot *tgbotapi.BotAPI) {
 				msg := tgbotapi.NewMessage(chatID, "Choose MP3 quality:")
 				msg.ReplyMarkup = keyboard
 				bot.Send(msg)
-
 			case "format_image":
 				userFormat[chatID] = "image"
 				processConversion(bot, chatID, "image", "")
-
 			case "mp4_1080", "mp4_720", "mp4_320":
 				quality := strings.TrimPrefix(data, "mp4_")
 				processConversion(bot, chatID, "mp4", quality)
-
 			case "mp3_128", "mp3_192", "mp3_320":
 				quality := strings.TrimPrefix(data, "mp3_")
 				processConversion(bot, chatID, "mp3", quality)
@@ -268,18 +309,15 @@ func handleTelegramBot(bot *tgbotapi.BotAPI) {
 func processConversion(bot *tgbotapi.BotAPI, chatID int64, format, quality string) {
 	waitMsg := tgbotapi.NewMessage(chatID, "⏳ Please wait, downloading and converting your file... This may take several minutes for long videos.")
 	sentMsg, _ := bot.Send(waitMsg)
-
 	req := ConvertRequest{
 		URL:     userURLs[chatID],
 		Format:  format,
 		Quality: quality,
 	}
 	reqBody, _ := json.Marshal(req)
-
 	client := &http.Client{
 		Timeout: 30 * time.Minute,
 	}
-
 	resp, err := client.Post("http://localhost:8080/api/convert", "application/json", bytes.NewBuffer(reqBody))
 	if err != nil {
 		edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "❌ API error: "+err.Error())
@@ -287,19 +325,15 @@ func processConversion(bot *tgbotapi.BotAPI, chatID int64, format, quality strin
 		return
 	}
 	defer resp.Body.Close()
-
 	var apiResp ConvertResponse
 	json.NewDecoder(resp.Body).Decode(&apiResp)
-
 	if apiResp.Error != "" {
 		edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "❌ Conversion error: "+apiResp.Error)
 		bot.Send(edit)
 		return
 	}
-
-	edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "📤 File converted successfully! Now uploading to Telegram...")
+	edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, fmt.Sprintf("📤 File converted successfully! Size: %s. Now uploading to Telegram...", apiResp.FileSize))
 	bot.Send(edit)
-
 	downloadURL := "http://localhost:8080" + apiResp.FilePath
 	fileResp, err := client.Get(downloadURL)
 	if err != nil {
@@ -308,14 +342,12 @@ func processConversion(bot *tgbotapi.BotAPI, chatID int64, format, quality strin
 		return
 	}
 	defer fileResp.Body.Close()
-
 	tempFile, err := os.CreateTemp("", "tgfile_*."+format)
 	if err != nil {
 		edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "❌ File error: "+err.Error())
 		bot.Send(edit)
 		return
 	}
-
 	_, err = io.Copy(tempFile, fileResp.Body)
 	if err != nil {
 		tempFile.Close()
@@ -325,7 +357,6 @@ func processConversion(bot *tgbotapi.BotAPI, chatID int64, format, quality strin
 		return
 	}
 	tempFile.Close()
-
 	var sendErr error
 	switch format {
 	case "image":
@@ -338,40 +369,33 @@ func processConversion(bot *tgbotapi.BotAPI, chatID int64, format, quality strin
 		video := tgbotapi.NewVideo(chatID, tgbotapi.FilePath(tempFile.Name()))
 		_, sendErr = bot.Send(video)
 	}
-
 	os.Remove(tempFile.Name())
-
 	if sendErr != nil {
 		edit := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "❌ Failed to send file: "+sendErr.Error())
 		bot.Send(edit)
 		return
 	}
-
 	edit = tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, "✅ Done! Your file has been sent and temporary files have been cleaned up.")
 	bot.Send(edit)
-
 	delete(userStates, chatID)
 	delete(userURLs, chatID)
 	delete(userFormat, chatID)
 }
 
 // ================= MAIN ===================
-
 func main() {
 	go func() {
 		r := mux.NewRouter()
 		r.HandleFunc("/api/convert", convertHandler).Methods("POST")
+		r.HandleFunc("/api/info", infoHandler).Methods("POST")
 		r.HandleFunc("/downloads/{filename}", downloadsHandler).Methods("GET")
-
 		fmt.Println("API running at http://localhost:8080")
 		log.Fatal(http.ListenAndServe(":8080", r))
 	}()
-
 	bot, err := tgbotapi.NewBotAPI("7144449198:AAHoMTB8azWfEo1WvbQ4A_EBF-2lO-TsNxQ")
 	if err != nil {
 		log.Fatal("Telegram bot error:", err)
 	}
 	fmt.Println("Telegram bot started as", bot.Self.UserName)
-
 	handleTelegramBot(bot)
 }
